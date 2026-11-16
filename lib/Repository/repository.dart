@@ -1,0 +1,1320 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:http/http.dart' as http;
+import 'package:ords_ba/Api_config/api_config.dart';
+import 'package:ords_ba/Data/device_id.dart';
+import 'package:ords_ba/Data/network_status.dart';
+import 'package:ords_ba/Data/local_store.dart';
+import 'package:ords_ba/Model/complaint_models.dart';
+import 'package:ords_ba/Model/dashboard_models.dart';
+import 'package:ords_ba/Model/models.dart';
+import 'package:ords_ba/Model/review_models.dart';
+import 'package:ords_ba/Model/shelf_models.dart';
+
+/// Thrown for any failed API call.
+class ApiException implements Exception {
+  final String message;
+  final int? statusCode;
+
+  /// True when the phone could not reach the server at all (offline).
+  final bool isNetwork;
+
+  /// True when the server did not answer in time (also shown as offline).
+  final bool isTimeout;
+
+  const ApiException(this.message, [this.statusCode,
+      this.isNetwork = false, this.isTimeout = false]);
+
+  /// Only HTTP 401 means the session is no longer valid.
+  bool get isUnauthorized => statusCode == 401;
+
+  /// Safe to queue the action and retry later (request never reached the
+  /// server). Timeouts are NOT included: the server may have received it.
+  bool get isNetworkUnavailable => isNetwork;
+
+  /// Any "no response from the internet" case.
+  bool get isOffline => isNetwork || isTimeout;
+
+  @override
+  String toString() => message;
+}
+
+class CnicCheckResult {
+  final bool allowed;
+  final String message;
+  final String? fullName;
+
+  const CnicCheckResult({
+    required this.allowed,
+    required this.message,
+    this.fullName,
+  });
+}
+
+class LoginResult {
+  final String token;
+  final AppUser user;
+  final bool allowAnyDevice;
+
+  const LoginResult(
+    this.token,
+    this.user, {
+    this.allowAnyDevice = false,
+  });
+}
+
+/// Every network call of the BA module lives here.
+class Repository {
+  Repository({http.Client? client}) : _client = client ?? http.Client();
+
+  final http.Client _client;
+
+  /* ----------------------------- helpers ----------------------------- */
+
+  Map<String, String> _headers({
+    String? token,
+    bool json = true,
+  }) {
+    return {
+      'Accept': 'application/json',
+      if (json) 'Content-Type': 'application/json',
+      if (token != null && token.isNotEmpty)
+        'Authorization': 'Bearer $token',
+      if (DeviceId.isReady) 'X-Device-Id': DeviceId.value,
+    };
+  }
+
+  dynamic _tryDecode(String body) {
+    if (body.trim().isEmpty) return null;
+
+    try {
+      return jsonDecode(body);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  String? _messageOf(dynamic data) {
+    if (data is Map) {
+      for (final key in [
+        'message',
+        'error',
+        'msg',
+        'detail',
+        'error_message',
+      ]) {
+        final value = data[key];
+
+        if (value != null && value.toString().trim().isNotEmpty) {
+          return value.toString();
+        }
+      }
+
+      final nested = data['data'];
+
+      if (nested is Map) {
+        return _messageOf(nested);
+      }
+    }
+
+    if (data is String && data.trim().isNotEmpty) {
+      return data;
+    }
+
+    return null;
+  }
+
+  /// Sends a request and converts HTTP/API/network errors into ApiException.
+  Future<dynamic> _send(
+    Future<http.Response> Function() call, {
+    Duration? timeout,
+  }) async {
+    http.Response response;
+
+    try {
+      response = await call().timeout(timeout ?? ApiConfig.timeout);
+    } on SocketException {
+      NetworkStatus.markOffline();
+      throw const ApiException(NetworkStatus.message, null, true);
+    } on TimeoutException {
+      NetworkStatus.markOffline();
+      throw const ApiException(NetworkStatus.message, null, false, true);
+    } on http.ClientException {
+      NetworkStatus.markOffline();
+      throw const ApiException(NetworkStatus.message, null, true);
+    }
+
+    // Any answer from the server (even an error page) means we are online.
+    NetworkStatus.markOnline();
+
+    final data = _tryDecode(utf8.decode(response.bodyBytes));
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      debugPrint('API ERROR ${response.statusCode}: '
+          '${utf8.decode(response.bodyBytes)}');
+      final fallback = switch (response.statusCode) {
+        401 => 'Session expired. Please login again.',
+        403 => 'You are not allowed to do this.',
+        404 => 'Service not found (404).',
+        _ => 'Request failed (${response.statusCode}).',
+      };
+
+      throw ApiException(
+        _messageOf(data) ?? fallback,
+        response.statusCode,
+      );
+    }
+
+    // Some ORDS handlers return HTTP 200 with success:false.
+    if (data is Map) {
+      final success = data['success'];
+      final status = data['status']?.toString().toLowerCase();
+
+      final failed = success == false ||
+          success?.toString().toLowerCase() == 'false' ||
+          status == 'error' ||
+          status == 'fail' ||
+          status == 'failed';
+
+      if (failed) {
+        throw ApiException(
+          _messageOf(data) ?? 'Request failed.',
+          response.statusCode,
+        );
+      }
+    }
+
+    return data;
+  }
+
+  /// Unwraps common response wrappers.
+  Map<String, dynamic>? _findMap(
+    dynamic data, [
+    int depth = 0,
+  ]) {
+    if (data is! Map) return null;
+
+    if (depth < 3) {
+      for (final key in [
+        'user',
+        'profile',
+        'data',
+        'result',
+      ]) {
+        final value = data[key];
+
+        if (value is Map) {
+          return _findMap(value, depth + 1);
+        }
+      }
+    }
+
+    return Map<String, dynamic>.from(data);
+  }
+
+  String? _findToken(dynamic data) {
+    if (data is Map) {
+      for (final key in [
+        'token',
+        'access_token',
+        'auth_token',
+        'session_token',
+        'bearer_token',
+      ]) {
+        final value = data[key];
+
+        if (value != null && value.toString().trim().isNotEmpty) {
+          return value.toString();
+        }
+      }
+
+      for (final key in [
+        'data',
+        'result',
+        'user',
+      ]) {
+        final token = _findToken(data[key]);
+
+        if (token != null) return token;
+      }
+    }
+
+    return null;
+  }
+
+  /// Reads an ORDS collection, including next-page references.
+  Future<List<Map<String, dynamic>>> _getAll(
+    String firstUrl, {
+    String? token,
+  }) async {
+    final output = <Map<String, dynamic>>[];
+    final seenUrls = <String>{};
+
+    String? url = firstUrl;
+    var guard = 0;
+
+    while (url != null && seenUrls.add(url) && guard++ < 100) {
+      final currentUrl = url;
+      final data = await _send(
+        () => _client.get(
+          Uri.parse(currentUrl),
+          headers: _headers(
+            token: token,
+            json: false,
+          ),
+        ),
+      );
+
+      List? items;
+      if (data is List) {
+        items = data;
+      } else if (data is Map) {
+        // Oracle ORDS Collection Feed returns rows in `items`.
+        // Also accept common wrappers used by ORDS custom handlers.
+        final value = data['items'] ?? data['data'] ?? data['results'];
+        if (value is List) {
+          items = value;
+        }
+      }
+
+      for (final item in items ?? const []) {
+        if (item is Map) {
+          output.add(Map<String, dynamic>.from(item));
+        }
+      }
+
+      String? next;
+      if (data is Map) {
+        // Standard ORDS pagination:
+        // "links": [{"rel":"next","href":"..."}]
+        final links = data['links'];
+        if (links is List) {
+          for (final link in links.whereType<Map>()) {
+            if (link['rel']?.toString().toLowerCase() == 'next' &&
+                link['href'] != null) {
+              next = Uri.parse(currentUrl)
+                  .resolve(link['href'].toString())
+                  .toString();
+              break;
+            }
+          }
+        }
+
+        // Also accept custom pagination formats.
+        final nextValue = data['next'];
+        if (next == null && nextValue is Map) {
+          final nextRef = nextValue[r'$ref'] ?? nextValue['href'];
+          if (nextRef != null) {
+            next = Uri.parse(currentUrl).resolve(nextRef.toString()).toString();
+          }
+        } else if (next == null && nextValue is String &&
+            nextValue.trim().isNotEmpty) {
+          next = Uri.parse(currentUrl).resolve(nextValue).toString();
+        }
+
+        if (data['hasMore'] == false || data['has_more'] == false) {
+          next = null;
+        }
+      }
+
+      if ((items ?? const []).isEmpty) {
+        next = null;
+      }
+      url = next;
+    }
+
+    return output;
+  }
+
+  /* ------------------------------ locations ------------------------------ */
+
+  Future<List<MartLocation>> fetchLocations() async {
+    const url = ApiConfig.locations;
+
+    final data = await _send(
+      () => _client.get(
+        Uri.parse(url),
+        headers: _headers(json: false),
+      ),
+    );
+
+    if (data is! Map) {
+      throw const ApiException(
+        'Unexpected locations response from server.',
+      );
+    }
+
+    final items = data['locations'];
+
+    if (items is! List) {
+      return const [];
+    }
+
+    return items
+        .whereType<Map>()
+        .map(
+          (item) => MartLocation.fromJson(
+            Map<String, dynamic>.from(item),
+          ),
+        )
+        .toList();
+  }
+
+  /* -------------------------------- auth -------------------------------- */
+
+  /// Verifies that a CNIC exists in the active BA registration allowlist.
+  /// CNIC is sent as 13 digits without hyphens.
+  ///
+  /// Expected successful response:
+  /// {
+  ///   "success": true,
+  ///   "allowed": true,
+  ///   "message": "CNIC verified successfully.",
+  ///   "full_name": "Fatima Abu Talib"
+  /// }
+  Future<CnicCheckResult> checkBaCnic({
+    required String cnic,
+  }) async {
+    final normalizedCnic = cnic.replaceAll(RegExp(r'\D'), '');
+
+    if (normalizedCnic.length != 13) {
+      throw const ApiException(
+        'CNIC must contain exactly 13 digits.',
+      );
+    }
+
+    final data = await _send(
+      () => _client.post(
+        Uri.parse(ApiConfig.checkBaCnic),
+        headers: _headers(),
+        body: jsonEncode({
+          'cnic': normalizedCnic,
+        }),
+      ),
+    );
+
+    debugPrint('CNIC CHECK RESPONSE: $data');
+
+    final responseMap = _findMap(data);
+
+    final allowed = responseMap?['allowed'] == true ||
+        responseMap?['allowed']?.toString().toLowerCase() == 'true';
+
+    final message = responseMap?['message']?.toString() ??
+        (allowed
+            ? 'CNIC is authorized for BA registration.'
+            : 'This CNIC is not authorized for BA registration.');
+
+    // The updated ORDS handler returns FULL_NAME as "full_name".
+    // Fallback keys are retained for compatibility with older responses.
+    final fullName = allowed
+        ? _findBaName(data)
+        : null;
+
+    return CnicCheckResult(
+      allowed: allowed,
+      message: message,
+      fullName: fullName,
+    );
+  }
+
+  /// Finds the registered BA name in the response.
+  /// Supports full_name and common alternative response keys.
+  String? _findBaName(dynamic data, [int depth = 0]) {
+    if (depth > 4) return null;
+
+    if (data is List) {
+      for (final item in data) {
+        final found = _findBaName(item, depth + 1);
+        if (found != null) return found;
+      }
+      return null;
+    }
+
+    if (data is! Map) return null;
+
+    final map = <String, dynamic>{
+      for (final entry in data.entries)
+        entry.key.toString().toLowerCase(): entry.value,
+    };
+
+    String? text(dynamic value) {
+      if (value is String && value.trim().isNotEmpty) {
+        return value.trim();
+      }
+      return null;
+    }
+
+    for (final key in [
+      'full_name',
+      'fullname',
+      'ba_name',
+      'baname',
+      'ba_full_name',
+      'employee_name',
+      'emp_name',
+      'name',
+    ]) {
+      final value = text(map[key]);
+      if (value != null) return value;
+    }
+
+    for (final entry in map.entries) {
+      final key = entry.key;
+
+      if (!key.contains('name')) continue;
+
+      if (key.contains('location') ||
+          key.contains('file') ||
+          key.contains('area') ||
+          key.contains('mart')) {
+        continue;
+      }
+
+      final value = text(entry.value);
+      if (value != null) return value;
+    }
+
+    for (final value in map.values) {
+      final found = _findBaName(value, depth + 1);
+      if (found != null) return found;
+    }
+
+    return null;
+  }
+
+  Future<String> signup({
+    required String fullName,
+    required String email,
+    required String cnic,
+    required String password,
+    required String confirmPassword,
+    required int locationId,
+  }) async {
+    final normalizedCnic = cnic.replaceAll(RegExp(r'\D'), '');
+
+    if (normalizedCnic.length != 13) {
+      throw const ApiException(
+        'CNIC must contain exactly 13 digits.',
+      );
+    }
+
+    final data = await _send(
+      () => _client.post(
+        Uri.parse(ApiConfig.signup),
+        headers: _headers(),
+        body: jsonEncode({
+          'full_name': fullName,
+          'email': email,
+          'cnic': normalizedCnic,
+          'password': password,
+          'confirm_password': confirmPassword,
+          'role': 'BA',
+          'location_id': locationId,
+          'device_id': DeviceId.value,
+        }),
+      ),
+    );
+
+    return _messageOf(data) ?? 'Account created. Please login.';
+  }
+
+  Future<LoginResult> login({
+    required String email,
+    required String password,
+  }) async {
+    final data = await _send(
+      () => _client.post(
+        Uri.parse(ApiConfig.login),
+        headers: _headers(),
+        body: jsonEncode({
+          'email': email,
+          'password': password,
+          'device_id': DeviceId.value,
+        }),
+      ),
+    );
+
+    final token = _findToken(data);
+
+    if (token == null) {
+      throw const ApiException(
+        'Login succeeded but no token was returned.',
+      );
+    }
+
+    final map = _findMap(data) ?? {};
+    final user = AppUser.fromJson(map);
+
+    final finalUser = user.email.isEmpty
+        ? user.mergeWith(
+            AppUser(
+              id: '',
+              fullName: 'BA',
+              email: email,
+            ),
+          )
+        : user;
+
+    // The login handler returns allow_any_device at the response root.
+    // Read it independently from the nested user object.
+    final root = data is Map ? Map<String, dynamic>.from(data) : <String, dynamic>{};
+    final allowAnyDevice =
+        root['allow_any_device'] == true ||
+        root['allow_any_device']?.toString().toLowerCase() == 'true';
+
+    return LoginResult(
+      token,
+      finalUser,
+      allowAnyDevice: allowAnyDevice,
+    );
+  }
+
+  /// Checks whether an account can be used on this device.
+  /// This check is advisory; the server must enforce device restrictions.
+ 
+Future<DeviceCheck> checkDevice({
+  required String email,
+  bool signup = false,
+}) async {
+  try {
+    // Signup: use the original device check.
+    // Login: use the account-aware device check.
+    final endpoint =
+        signup ? ApiConfig.deviceCheck : ApiConfig.deviceIdCheck;
+
+    final data = await _send(
+      () => _client.post(
+        Uri.parse(endpoint),
+        headers: _headers(),
+        body: jsonEncode({
+          'email': email.trim().toLowerCase(),
+          'device_id': DeviceId.value,
+          if (signup) 'mode': 'signup',
+        }),
+      ),
+    );
+
+    final responseMap = _findMap(data);
+
+    if (responseMap == null) {
+      return const DeviceCheck(
+        true,
+        '',
+      );
+    }
+
+    // Signup keeps the original response behavior.
+    if (signup) {
+      final allowedValue = responseMap['allowed'];
+
+      if (allowedValue == false ||
+          allowedValue?.toString().toLowerCase() == 'false') {
+        return DeviceCheck(
+          false,
+          responseMap['message']?.toString() ??
+              'This device is not allowed for signup.',
+        );
+      }
+
+      return const DeviceCheck(true, '');
+    }
+
+    // Login: ALLOW_ANY_DEVICE = Y is explicitly permitted.
+    final allowAnyDevice =
+        responseMap['allow_any_device'] == true ||
+        responseMap['allow_any_device']
+                ?.toString()
+                .toLowerCase() ==
+            'true';
+
+    if (allowAnyDevice) {
+      return const DeviceCheck(true, '');
+    }
+
+    // Normal users must pass the account-specific device check.
+    final deviceAllowed =
+        responseMap['device_allowed'] == true ||
+        responseMap['device_allowed']
+                ?.toString()
+                .toLowerCase() ==
+            'true';
+
+    if (!deviceAllowed) {
+      return DeviceCheck(
+        false,
+        responseMap['message']?.toString() ??
+            'This account is registered on another device.',
+      );
+    }
+
+    return const DeviceCheck(true, '');
+  } catch (_) {
+    // Preserve the existing fallback behavior.
+    // The login API must still enforce device restrictions.
+    return const DeviceCheck(true, '');
+  }
+}
+
+  /// Links the account to this phone.
+  Future<String?> bindDevice({
+    String? token,
+    required String email,
+  }) async {
+    try {
+      final data = await _send(
+        () => _client.post(
+          Uri.parse(ApiConfig.deviceBind),
+          headers: _headers(token: token),
+          body: jsonEncode({
+            'email': email,
+            'device_id': DeviceId.value,
+          }),
+        ),
+      );
+
+      final responseMap = _findMap(data);
+
+      if (responseMap?['bound'] == false ||
+          responseMap?['bound']?.toString().toLowerCase() == 'false') {
+        return responseMap?['message']?.toString() ??
+            'Device could not be linked.';
+      }
+
+      return null;
+    } on ApiException catch (e) {
+      return e.message;
+    } catch (_) {
+      return 'No answer from the server.';
+    }
+  }
+
+  /// Checks whether the current phone's device ID is already registered.
+  /// This endpoint is intentionally independent of the legacy email/device
+  /// check used during login and signup.
+  Future<bool> isDeviceIdRegistered({required String deviceId}) async {
+    final data = await _send(
+      () => _client.post(
+        Uri.parse(ApiConfig.deviceIdCheck),
+        headers: _headers(),
+        body: jsonEncode({'device_id': deviceId}),
+      ),
+    );
+    final map = _findMap(data);
+    final registered = map?['registered'];
+    if (registered == true ||
+        registered?.toString().toLowerCase() == 'true') {
+      return true;
+    }
+    if (registered == false ||
+        registered?.toString().toLowerCase() == 'false') {
+      return false;
+    }
+    throw const ApiException('Unexpected device check response.');
+  }
+
+  /// POST /auth/device-id/check/ -> should the "Update Device ID" option be shown?
+  /// Uses `show_update_option`; if the server omits it, falls back to `!registered`.
+  Future<bool> shouldShowDeviceUpdate({required String deviceId}) async {
+    final data = await _send(
+      () => _client.post(
+        Uri.parse(ApiConfig.deviceIdCheck),
+        headers: _headers(),
+        body: jsonEncode({'device_id': deviceId}),
+      ),
+    );
+    final map = _findMap(data);
+    bool? flag(dynamic v) {
+      if (v is bool) return v;
+      final s = v?.toString().toLowerCase();
+      if (s == 'true') return true;
+      if (s == 'false') return false;
+      return null;
+    }
+
+    final show = flag(map?['show_update_option']);
+    if (show != null) return show;
+    final registered = flag(map?['registered']);
+    if (registered != null) return !registered;
+    throw const ApiException('Unexpected device check response.');
+  }
+
+  /// Updates the device after the existing CNIC allowlist API verifies it.
+  /// The ORDS handler must independently validate CNIC/account ownership.
+  Future<String> updateDeviceId({
+    required String fullName,
+    required String cnic,
+    required String deviceId,
+  }) async {
+    final normalizedCnic = cnic.replaceAll(RegExp(r'\D'), '');
+    if (normalizedCnic.length != 13) {
+      throw const ApiException('CNIC must contain exactly 13 digits.');
+    }
+    final data = await _send(
+      () => _client.post(
+        Uri.parse(ApiConfig.deviceIdUpdate),
+        headers: _headers(),
+        body: jsonEncode({
+          'full_name': fullName.trim(),
+          'cnic': normalizedCnic,
+          'device_id': deviceId,
+        }),
+      ),
+    );
+    final map = _findMap(data);
+    final updated = map?['updated'];
+    if (updated == false ||
+        updated?.toString().toLowerCase() == 'false') {
+      throw ApiException(_messageOf(data) ?? 'Device update failed.');
+    }
+    return _messageOf(data) ?? 'Device registered successfully.';
+  }
+
+  Future<AppUser> fetchProfile(String token) async {
+    final data = await _send(
+      () => _client.get(
+        Uri.parse(ApiConfig.profile),
+        headers: _headers(
+          token: token,
+          json: false,
+        ),
+      ),
+    );
+
+    final map = _findMap(data);
+
+    if (map == null) {
+      throw const ApiException('Could not read profile.');
+    }
+
+    return AppUser.fromJson(map);
+  }
+
+  /* ----------------------------- attendance ----------------------------- */
+
+  Future<String> attendanceIn({
+    required String token,
+    required double latitude,
+    required double longitude,
+    required int locationId,
+    required Uint8List selfie,
+  }) {
+    return _attendance(
+      ApiConfig.attendanceIn,
+      token,
+      latitude,
+      longitude,
+      locationId,
+      'Attendance IN marked.',
+      extra: {
+        'selfie_base64': base64Encode(selfie),
+        'selfie_mime': 'image/jpeg',
+      },
+    );
+  }
+
+  Future<String> attendanceOut({
+    required String token, 
+    required double latitude,
+    required double longitude,
+    required int locationId,
+    required Uint8List selfie,
+  }) {
+    return _attendance(
+      ApiConfig.attendanceOut,
+      token,
+      latitude,
+      longitude,
+      locationId,
+      'Attendance OUT marked.',
+      extra: {
+        'selfie_base64': base64Encode(selfie),
+        'selfie_mime': 'image/jpeg',
+      },
+    );
+  }
+
+  Future<String> _attendance(
+    String url,
+    String token,
+    double latitude,
+    double longitude,
+    int locationId,
+    String fallback, {
+    Map<String, dynamic> extra = const {},
+  }) async {
+    final data = await _send(
+      () => _client.post(
+        Uri.parse(url),
+        headers: _headers(token: token),
+        body: jsonEncode({
+          'latitude': latitude,
+          'longitude': longitude,
+          'location_id': locationId,
+          ...extra,
+        }),
+      ),
+      timeout: ApiConfig.uploadTimeout,
+    );
+
+    return _messageOf(data) ?? fallback;
+  }
+
+  /* -------------------------------- sales -------------------------------- */
+
+  /// Fetches active SKUs only.
+  Future<List<Sku>> fetchSkus() async {
+    final rows = await _getAll(ApiConfig.skuList);
+
+    final seen = <int>{};
+    final output = <Sku>[];
+
+    for (final row in rows) {
+      if (!Sku.isActive(row)) continue;
+
+      final sku = Sku.fromJson(row);
+
+      if (sku.skuId == 0 || !seen.add(sku.skuId)) {
+        continue;
+      }
+
+      output.add(sku);
+    }
+
+    output.sort((a, b) {
+      final groupCompare =
+          a.group.toLowerCase().compareTo(b.group.toLowerCase());
+
+      if (groupCompare != 0) {
+        return groupCompare;
+      }
+
+      return a.itemName.toLowerCase().compareTo(b.itemName.toLowerCase());
+    });
+
+    return output;
+  }
+
+  Future<String> enterSales({
+    required String token,
+    required int locationId,
+    required String saleDate,
+    required Map<int, int> quantities,
+  }) async {
+    final data = await _send(
+      () => _client.post(
+        Uri.parse(ApiConfig.enterSales),
+        headers: _headers(token: token),
+        body: jsonEncode({
+          'location_id': locationId,
+          'sale_date': saleDate,
+          'items': [
+            for (final entry in quantities.entries)
+              {
+                'sku_id': entry.key,
+                'quantity': entry.value,
+              },
+          ],
+        }),
+      ),
+    );
+
+    return _messageOf(data) ?? 'Sales saved.';
+  }
+
+  /* --------------------------- shelf picture --------------------------- */
+
+  Future<String> uploadShelfPicture({
+    required String token,
+    required int userId,
+    required int locationId,
+    required double latitude,
+    required double longitude,
+    required String fileName,
+    required Uint8List bytes,
+    String remarks = '',
+  }) async {
+    final lower = fileName.toLowerCase();
+
+    final mime = lower.endsWith('.png') ? 'image/png' : 'image/jpeg';
+
+    final data = await _send(
+      () => _client.post(
+        Uri.parse(ApiConfig.shelfUpload),
+        headers: _headers(token: token),
+        body: jsonEncode({
+          'user_id': userId,
+          'location_id': locationId,
+          'latitude': latitude,
+          'longitude': longitude,
+          'file_name': fileName,
+          'image_mime': mime,
+          'remarks': remarks,
+          'image_base64': base64Encode(bytes),
+        }),
+      ),
+      timeout: ApiConfig.uploadTimeout,
+    );
+
+    if (data is Map && data['id'] != null) {
+      return data['id'].toString();
+    }
+
+    return '';
+  }
+
+  /// Fetch all shelf-picture metadata for the signed-in BA.
+  /// Images are fetched separately by picture ID from the protected image API.
+  Future<List<ShelfPicture>> fetchShelfPictures({
+    required String token,
+  }) async {
+    final data = await _send(
+      () => _client.get(
+        Uri.parse(ApiConfig.shelfList),
+        headers: _headers(token: token, json: false),
+      ),
+    );
+
+    if (data is! Map) {
+      throw const ApiException('Unexpected shelf pictures response.');
+    }
+
+    final raw = data['pictures'] ?? data['items'];
+    if (raw is! List) {
+      throw ApiException(
+        _messageOf(data) ?? 'Shelf pictures were not returned by the server.',
+      );
+    }
+
+    return [
+      for (final item in raw)
+        if (item is Map)
+          ShelfPicture.fromJson(Map<String, dynamic>.from(item)),
+    ].where((picture) => picture.id > 0).toList();
+  }
+
+  /// URL of one shelf picture. Load it with [imageHeaders].
+  String shelfImageUrl(int pictureId) => ApiConfig.shelfImage(pictureId);
+
+  /// Headers needed to download protected images (Image.network).
+  Map<String, String> imageHeaders(String token) => {
+        if (token.isNotEmpty) 'Authorization': 'Bearer $token',
+        if (DeviceId.isReady) 'X-Device-Id': DeviceId.value,
+      };
+
+  /* ----------------------------- low stock ----------------------------- */
+
+  /// Same style as [enterSales]: the BA is identified by the Bearer token
+  /// on the server, so no user id is sent. The request carries the location,
+  /// the date and, per product, the SKU id plus the ticked question ids.
+  ///
+  /// Returns the new low stock report id (empty string if not returned).
+
+Future<String> submitLowStock({
+  required String token,
+  required int userId,
+  required int locationId,
+  required String stockDate,
+  required List<int> skuIds,
+  Map<int, List<int>> questionsBySku = const {},
+}) async {
+  final data = await _send(
+    () => _client.post(
+      Uri.parse(ApiConfig.lowStockSubmit),
+      headers: _headers(token: token),
+      body: jsonEncode({
+        'user_id': userId,
+        'location_id': locationId,
+        'stock_date': stockDate,
+        'items': [
+          for (final id in skuIds)
+            {
+              'sku_id': id,
+              'question_ids': questionsBySku[id] ?? const <int>[],
+            },
+        ],
+      }),
+    ),
+  );
+
+  if (data is Map && data['id'] != null) {
+    return data['id'].toString();
+  }
+
+  throw ApiException('Invalid response from Low Stock API');
+}
+
+  Future<List<ReviewQuestion>> fetchReviewQuestions({
+    required String token,
+  }) async {
+    final data = await _send(
+      () => _client.get(
+        Uri.parse(ApiConfig.reviewQuestions),
+        headers: _headers(
+          token: token,
+          json: false,
+        ),
+      ),
+    );
+
+    final list = data is Map ? data['questions'] : null;
+
+    if (list is! List) {
+      return const [];
+    }
+
+    return [
+      for (final item in list)
+        if (item is Map)
+          ReviewQuestion.fromJson(
+            Map<String, dynamic>.from(item),
+          ),
+    ].where((question) {
+      return question.id > 0 && question.text.isNotEmpty;
+    }).toList();
+  }
+
+  /* ------------------------------ dashboard ------------------------------ */
+
+  Future<DashboardStats> fetchDashboardSales({
+    required String token,
+    required String period,
+  }) async {
+    final uri = Uri.parse(ApiConfig.dashboardSales).replace(
+      queryParameters: {
+        'period': period,
+      },
+    );
+
+    final data = await _send(
+      () => _client.get(
+        uri,
+        headers: _headers(
+          token: token,
+          json: false,
+        ),
+      ),
+    );
+
+    if (data is! Map) {
+      throw const ApiException(
+        'Unexpected dashboard response.',
+      );
+    }
+
+    return DashboardStats.fromJson(
+      Map<String, dynamic>.from(data),
+    );
+  }
+
+  /* -------------------------------- leaves -------------------------------- */
+
+  Future<List<Map<String, dynamic>>> fetchLeaves({
+    required String token,
+    String filter = 'all',
+  }) async {
+    final uri = Uri.parse(ApiConfig.leaveList).replace(
+      queryParameters: {
+        'filter': filter,
+      },
+    );
+
+    final data = await _send(
+      () => _client.get(
+        uri,
+        headers: _headers(
+          token: token,
+          json: false,
+        ),
+      ),
+    );
+
+    final list = data is Map ? data['leaves'] : null;
+
+    if (list is! List) {
+      return const [];
+    }
+
+    return [
+      for (final item in list)
+        if (item is Map) Map<String, dynamic>.from(item),
+    ];
+  }
+
+  Future<int?> applyLeave({
+    required String token,
+    required String fromDate,
+    required String toDate,
+    required String reason,
+  }) async {
+    final data = await _send(
+      () => _client.post(
+        Uri.parse(ApiConfig.leaveApply),
+        headers: _headers(token: token),
+        body: jsonEncode({
+          'from_date': fromDate,
+          'to_date': toDate,
+          'reason': reason,
+        }),
+      ),
+    );
+
+    if (data is Map) {
+      return int.tryParse('${data['leave_id']}');
+    }
+
+    return null;
+  }
+
+  Future<void> cancelLeave({
+    required String token,
+    required int id,
+  }) async {
+    await _send(
+      () => _client.post(
+        Uri.parse(ApiConfig.leaveCancel(id)),
+        headers: _headers(token: token),
+        body: '{}',
+      ),
+    );
+  }
+
+  /* ----------------------------- complaints ----------------------------- */
+
+  Future<List<Complaint>> fetchComplaints({
+    required String token,
+  }) async {
+    final data = await _send(
+      () => _client.get(
+        Uri.parse(ApiConfig.complaintList),
+        headers: _headers(
+          token: token,
+          json: false,
+        ),
+      ),
+    );
+
+    final list = data is Map ? data['complaints'] : null;
+
+    if (list is! List) {
+      return const [];
+    }
+
+    return [
+      for (final item in list)
+        if (item is Map)
+          Complaint.fromJson(
+            Map<String, dynamic>.from(item),
+          ),
+    ];
+  }
+
+  Future<int> createComplaint({
+    required String token,
+    required String title,
+    required String description,
+    Uint8List? image,
+  }) async {
+    final data = await _send(
+      () => _client.post(
+        Uri.parse(ApiConfig.complaintCreate),
+        headers: _headers(token: token),
+        body: jsonEncode({
+          'title': title,
+          'description': description,
+          if (image != null) 'image_base64': base64Encode(image),
+          if (image != null) 'image_mime': 'image/jpeg',
+        }),
+      ),
+      timeout: ApiConfig.uploadTimeout,
+    );
+
+    final id = data is Map ? data['complaint_id'] : null;
+
+    if (id is num) {
+      return id.toInt();
+    }
+
+    return int.tryParse('$id') ?? 0;
+  }
+
+  /// Flushes offline submissions in creation order. A failed item remains
+  /// queued; subsequent items are not sent out of order.
+  Future<int> syncPendingActions({
+    required String token,
+    required PendingActionStore store,
+  }) async {
+    var synced = 0;
+    for (final item in store.all()) {
+      final id = item['id']?.toString() ?? '';
+      final type = item['type']?.toString() ?? '';
+      final p = Map<String, dynamic>.from(item['payload'] as Map);
+      try {
+        switch (type) {
+          case 'sale':
+            final raw = Map<String, dynamic>.from(p['quantities'] as Map);
+            await enterSales(
+              token: token,
+              locationId: (p['location_id'] as num).toInt(),
+              saleDate: p['sale_date'].toString(),
+              quantities: {
+                for (final e in raw.entries)
+                  int.parse(e.key.toString()): (e.value as num).toInt(),
+              },
+            );
+            break;
+          case 'complaint':
+            await createComplaint(
+              token: token,
+              title: p['title'].toString(),
+              description: p['description'].toString(),
+              image: p['image_base64'] == null
+                  ? null
+                  : Uint8List.fromList(base64Decode(p['image_base64'].toString())),
+            );
+            break;
+          case 'leave':
+            await applyLeave(
+              token: token,
+              fromDate: p['from_date'].toString(),
+              toDate: p['to_date'].toString(),
+              reason: p['reason'].toString(),
+            );
+            break;
+          case 'shelf':
+            await uploadShelfPicture(
+              token: token,
+              userId: (p['user_id'] as num).toInt(),
+              locationId: (p['location_id'] as num).toInt(),
+              latitude: (p['latitude'] as num).toDouble(),
+              longitude: (p['longitude'] as num).toDouble(),
+              fileName: p['file_name'].toString(),
+              bytes: Uint8List.fromList(base64Decode(p['image_base64'].toString())),
+              remarks: p['remarks']?.toString() ?? '',
+            );
+            break;
+          default:
+            // Unknown entries are retained for inspection rather than lost.
+            continue;
+        }
+        await store.remove(id);
+        synced++;
+      } on ApiException catch (e) {
+        if (e.isUnauthorized) rethrow;
+        break;
+      } catch (_) {
+        break;
+      }
+    }
+    return synced;
+  }
+
+  /// Call this when the Repository is no longer needed.
+  void dispose() {
+    _client.close();
+  }
+}

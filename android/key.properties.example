@@ -1,0 +1,7 @@
+# Copy to android/key.properties (git-ignored) and fill in your real password.
+# Keystore is PKCS12, so the key password is the same as the store password.
+storePassword=YOUR_KEYSTORE_PASSWORD
+keyPassword=YOUR_KEYSTORE_PASSWORD
+keyAlias=my-alias
+# Use forward slashes. Move the .jks out of Downloads first, e.g. ~/keystores/
+storeFile=/Users/stranger/keystores/my-release-key.jks

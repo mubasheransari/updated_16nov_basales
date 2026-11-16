@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The BA backend is currently plain HTTP. Cleartext is allowed ONLY for this host.
+     When the server gets an HTTPS certificate: switch ApiConfig.base (and the URL in
+     repository.dart) to https://, then delete this file and its manifest reference. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">tapex.mezangrp.com</domain>
+    </domain-config>
+</network-security-config>
